@@ -1,0 +1,1021 @@
+---
+title: "Assignment part 2"
+author: "Nguyen Phuc Thai"
+date: "`r Sys.Date()`"
+output: bookdown::pdf_document2
+toc: true
+colorlinks: true
+fontsize: 12pt
+fig_caption: yes
+geometry: margin=2.3cm
+number_section: yes
+
+header-includes:
+  \usepackage{float}
+---
+
+
+```{r global-options, include=FALSE}
+library(float)
+knitr::opts_chunk$set(warning=FALSE, message=FALSE,fig.width=6, fig.height=3, fig.align =  'center',fig.pos = 'H')
+```
+
+```{r library, echo=F}
+setwd("~/Dropbox/ACTL4305/Assignment part 2")
+#packages
+library(ggplot2)
+library(caret)
+library(tidyr)
+library(dplyr)
+library(corrplot)
+library(MASS)
+library(tree)
+library(randomForest)
+library(gridExtra)
+library(boot)
+library(kableExtra)
+RNGkind(sample.kind = 'Rounding')
+```
+
+
+#Data import
+```{r data import,cache=T, include=F}
+gen.data<-read.csv('A2-data.csv')%>%dplyr::select(-Index)
+```
+
+The data was imported using `read.csv`. And a summary of the variables presented in the data is as follow
+
+```{r summary, cache=T, echo=F}
+
+options(width = 100)
+options(knitr.kable.NA = "")
+kable(list(summary(gen.data[,1:7],digit=2),summary(gen.data[,8:14],digit=2),
+           summary(gen.data[,15:21],digit=2),summary(gen.data[,22:23],digit=2)),align='l',caption = "Summary of variables")%>%kable_styling(font_size = 10,bootstrap_options ="condensed", full_width = F,latex_options = "HOLD_position")
+```
+
+
+
+
+#Data preparation
+
+The data was properly cleaned,hence only data preparation is needed. 
+
+From table \@ref(tab:summary) and according to the provided data dictionary, I will change the class of `ncd.level` and `region` variables to factor as they are currently recognized as numerical data. 
+
+Furthermore, `year` column will be removed from this dataset and not used for modelling. This is because it informs us the time that these observations were recorded. Hence the model built will make prediction on future data, and thus have different years from what we have.
+
+Finally, I will create 3 new variables for this dataset for frequency, severity and total loss (denoted as freq, sev and tot.loss respectively) they are calculated as follow:
+
+```{r preparation, cache=T}
+gen.data$region<-as.factor(gen.data$region)
+gen.data$ncd.level<-as.factor(gen.data$ncd.level)
+
+gen.data1<-gen.data%>%
+  dplyr::select(-year)%>%
+  mutate(freq=claim.count/exposure,
+         sev=ifelse(claim.incurred>0,
+                    claim.incurred/claim.count,0),
+         tot.loss=claim.incurred/exposure)
+
+cat.col<-which(lapply(gen.data1, class)=='factor')
+num.col<-which(lapply(gen.data1, class)!='factor')
+```
+##Data splitting
+This step is done beforehand. And every exploration will be from the training data to avoid information leakage. All members from my group will also split the data similarly
+
+```{r splitting train-test}
+set.seed(1)
+index <- createDataPartition(gen.data$year,p = 0.75,list = FALSE)
+train.data <- gen.data1[index,]
+test.data <- gen.data1[-index,]
+
+```
+#Exploratory analysis
+
+##Multicollinearity
+
+```{r cor-plot, echo=F, cache=T,fig.cap="\\label{fig:cor-plot} Correlation plot",fig.width=7}
+corrplot(cor(train.data[,num.col[-c(14:18)]]), 
+         method ="circle",
+         mar=c(0,0,1,0)
+)
+```
+Figure \@ref(fig:cor-plot) shows several strong correlation between the variables. These include the negative correlation between `vehicle.age` and `vehicle value`, which is expected as the older a vehicle is, the cheaper it becomes. Moreover, we can also observe some strong correlation between a vehicle features (`no.seat`,`cubic.cent`,`horse.power`,`weight`, `height`, `length` and `width`).
+Hence these variable need to be consider carefully when doing fitting as inclusion of them in the model may negatively affect its performance.
+
+Hence to account for them, I will use principal components (PC) to combine these correlated variable together
+
+```{r pca, cache=T}
+#Vehicle size
+gen.size.pca1 <- prcomp(train.data[, 12:18],  scale = TRUE)
+gen.size_colsnames <- paste0("PCsize", c(1:7))
+colnames(gen.size.pca1$x)<-gen.size_colsnames
+
+
+gen.pca<-rep(NA,nrow(gen.data1)*3)
+dim(gen.pca)<-c(nrow(gen.data1),3)
+for(j in 1:3){
+for(i in 1:nrow(gen.data1)){
+  
+ gen.pca[i,j]<-sum(gen.size.pca1$rotation[,j]* (gen.data1[i,12:18]-
+     gen.size.pca1$center)/gen.size.pca1$scale )
+}
+} 
+colnames(gen.pca)<-gen.size_colsnames[1:3]
+gen.data3<-cbind(gen.data1[,-c(12:18)],gen.pca)
+
+#vehicle age/value
+gen.age.pca1 <- prcomp(train.data[, 10:11],  scale = TRUE)
+gen.age_colsnames <- paste0("PCage", c(1:2))
+colnames(gen.age.pca1$x)<-gen.age_colsnames
+gen.pca.age<-rep(NA,nrow(gen.data1))
+  for(i in 1:nrow(gen.data1)){
+    gen.pca.age[i]<-sum(gen.age.pca1$rotation[,1]* (gen.data1[i,10:11]-
+                          gen.age.pca1$center)/gen.age.pca1$scale )
+  }
+gen.data3<-cbind(gen.data3[,-c(10:11)],PCage1=gen.pca.age)
+
+train.data1 <- gen.data3[index, ]
+test.data1 <- gen.data3[-index, ]
+```
+
+And then to decide the number of PCs to be used I will look at the proportion of variance explained by these components
+
+**Vehicle size components**
+```{r PCA 1, echo=F}
+summary(gen.size.pca1)
+```
+
+**Vehicle value and age components**
+```{r PCA 2, echo=F}
+summary(gen.age.pca1)
+```
+For the Vehicle size, only the first 3 components explain more than 10% of the variance, they will be chosen. For vehicle age and value, as there are only 2 components, and the first one explain more data 80% of the variance, it will be the only one to be used for modelling.
+
+##Distribution of response
+The distribution of claim count and severity are as follows
+```{r freqsevdist, echo=F,cache=T, fig.cap="\\label{fig:freqdist} Claim count distribution" }
+plot1<-ggplot(train.data)+
+  geom_bar(aes(x=claim.count))
+plot2<-ggplot(train.data%>%
+         filter(sev>0))+
+  geom_density(aes(x=sev))
+grid.arrange(plot1,plot2, ncol=2)
+```
+
+
+
+From figure \@ref(fig:freqdist), most policyholders lodge no claim in the data set. Meanwhile most claims have severity between 0 and 1250, but the distribution also have a very large tail, with some have severity of nearly 10,000
+
+Some exploration of the relationship between the response variables and the predictors are shown in Appendix 6.1. This exploration reveals no standout relationship between predictors and the responses
+
+#Modelling
+
+##Methodology
+
+Evaluating the pure premium by estimating severity and frequency independently.
+
+Severity and Frequency will be modelled using GLMs
+
+For Frequency: I will model claim count then the predicted frequency will be predicted claim count divided by exposure. Modelled using GLM with Negative Binomial distribution, with log link and Exposure being considered as the offset in this model.
+
+For Severity: Modelled using GLM with Gamma distribution with log link
+
+**The modelling steps involve:**
+
+**First** fit a raw models using all the predictors. However, two sets of predictors is tested, 1 with all highly correlated variables remained untouched, and 1 with highly correlated variables combined via Principal components Analysis. If an offset is used, add two more models in this initial steps
+
+**Then** feature selection is applied. Method 1 is using backward selection with `stepAIC()`. This function start from the full model, then trim responses until the minimal AIC is obtained. Method 2 is just removing the unimportant variables with high coefficient (as they are the ones that will have more impact on the model, as discussed by guest lecturer, Dr. Hugh Miller). 2 methods are applied because there are many variables, hence many insignificant variables with low coefficient may have significant overall impact on predictions.
+
+Collapsing categorical data's level is also considered. Collapsing methods: levels that are similar of mean and median with respect to the response and appearance frequency in the data are combined. And this is done on the training data to avoid information leakage.
+
+**Finally**, interaction terms will be tested and added to the model.
+Tested on targeted groups of features, with the 2 groups being:
+
++ Personal information of policyholders (marital.status, driver.gender, driver.age)
++ Vehicle information (vehicle.age, vehicle.value, no.seats, cubic.cent, horse.power, weight, fuel.type, length, width, height or their corresponding Principle components)
+
+##Frequency
+For claim.count, it is important to notice that each observation have different exposure, which is the period during the year that they are covered by insurance. And hence the number of claim can be expected to vary proportionally with the exposure (people with longer exposure have more time for claim and hence may make more claim). Therefore, this variable may be an offset for the claim.count variable.
+
+###Initial models
+
+
+```{r freq.raw, cache=T}
+#count model with no offset and no PCA variable
+countmodel.nb<-glm.nb(claim.count~.-freq-sev-tot.loss-claim.incurred,
+                     data=train.data )
+#count model with no offset and with PCA variable
+countmodel.nb1<-glm.nb(claim.count~.-freq-sev-tot.loss-claim.incurred,
+                      data=train.data1 )
+
+#count model with offset and no PCA variables
+countmodel.nb.off<-glm.nb(claim.count~.+offset(log(exposure))-exposure-freq-
+                        sev-tot.loss-claim.incurred, data=train.data )
+
+#count model with offset and PCA variables
+countmodel.nb.off1<-glm.nb(claim.count~.+offset(log(exposure))-exposure-freq-
+                        sev-tot.loss-claim.incurred, data=train.data1 )
+
+tab1<-cbind(rbind(AIC(countmodel.nb),AIC(countmodel.nb1),
+                        AIC(countmodel.nb.off),AIC(countmodel.nb.off1)),
+                  rbind(BIC(countmodel.nb),BIC(countmodel.nb1),
+                        BIC(countmodel.nb.off),BIC(countmodel.nb.off1)))
+colnames(tab1)<-c('AIC','BIC')
+rownames(tab1)<-c('Negative binomial with no PC','Negative binomial with PC',
+                  'Negative binomial with no PC (with offset)',
+                  'Negative binomial with PC (with offset)')
+k=5
+set.seed(1)
+P1<-cv.glm(train.data,countmodel.nb,K=k)
+P2<-cv.glm(train.data1,countmodel.nb1,K=k)
+P3<-cv.glm(train.data,countmodel.nb.off,K=k)
+P4<-cv.glm(train.data1,countmodel.nb.off1,K=k)
+cv.error1<-c(P1$delta[2],P2$delta[2],P3$delta[2],P4$delta[2])
+pred.nb<-predict(countmodel.nb,test.data,type='response')
+pred.nb1<-predict(countmodel.nb1,test.data1,type='response')
+pred.nb.off<-predict(countmodel.nb.off,test.data,type='response')
+pred.nb.off1<-predict(countmodel.nb.off1,test.data1,type='response')
+test.MSE<-c(RMSE(test.data$claim.count,pred.nb),
+            RMSE(test.data$claim.count,pred.nb1),
+            RMSE(test.data$claim.count,pred.nb.off),
+            RMSE(test.data$claim.count,pred.nb.off1))
+tab1<-cbind(tab1,cv.error1,test.MSE)
+```
+```{r freqres1, cache=T, echo=F}
+knitr::kable(tab1, caption='performance of initial claim count models')%>%
+  kable_styling(latex_options = "HOLD_position" )
+```
+
+From table \@ref(tab:freqres1) all of the criteria used seem to agree that the model with the offset is better comparing to the one that does not have the offset. 
+However, regarding the use of principal components, it is suprising to find that models with no PC outperforms the one with PC in all 3 out of 4 criteria, because the latter use less features and its feature is not highly correlated. The only area that the models with PC win is BIC, where the number of features used is penalized harder compared to AIC. **Yet because of this result, I will move forward with the model with offset that did not utilize PCA.**
+
+Before that it is worth looking at the residual plots from these models
+```{r FV-SDR1, cache=T,echo=F, fig.width=7, fig.height=4, fig.align =  'center',fig.pos = 'H',fig.cap="\\label{fig:FV-SDR1} Fitted value vs standardized deviance residuals."}
+par(mfrow=c(2,2) )
+
+plot(countmodel.nb$fitted.values,rstandard(countmodel.nb),
+     xlab="FV",ylab="SDR",
+     main="Model with no offset, no PC")
+abline(h=0,col="red",lty=2)
+plot(countmodel.nb1$fitted.values,rstandard(countmodel.nb1),
+     xlab="FV",ylab="SDR",
+     main="Model with no offset, with PC")
+abline(h=0,col="red",lty=2)
+plot(countmodel.nb.off$fitted.values,rstandard(countmodel.nb.off),
+     xlab="FV",ylab="SDR",
+     main="Model with offset, no PC")
+abline(h=0,col="red",lty=2)
+plot(countmodel.nb.off1$fitted.values,rstandard(countmodel.nb.off1),
+     xlab="FV",ylab="SDR",
+     main="Model with offset and PC" )
+abline(h=0,col="red",lty=2)
+```
+
+```{r qq1,cache=T,echo=F, fig.width=7, fig.height=4, fig.align =  'center',fig.pos = 'H',fig.cap="\\label{fig:qq1} QQ plots" }
+par(mfrow=c(2,2) )
+qqnorm(rstandard(countmodel.nb),main='no offset,no PC' ) 
+qqline(rstandard(countmodel.nb),col="red")
+
+qqnorm(rstandard(countmodel.nb1),main='no offset,with PC') 
+qqline(rstandard(countmodel.nb1),col="red")
+
+qqnorm(rstandard(countmodel.nb.off),main='with offset,no PC') 
+qqline(rstandard(countmodel.nb.off),col="red")
+
+qqnorm(rstandard(countmodel.nb.off1),main='with offset and PC') 
+qqline(rstandard(countmodel.nb.off1),col="red")
+
+```
+
+Both figure \@ref(fig:FV-SDR1) and \@ref(fig:qq1) show that using Negative binomials assumption is quite inadequate for the claim count. For it to be an appropriate fit, the errors shown in \@ref(fig:FV-SDR1) should have no particular trend around the red line. Also, in the QQ plots \@ref(fig:qq1) the points fit the line very poorly at the right tails indicating that the models underfit when the number of claims grow bigger. These plot indicate another model may be more adequate. However, as one goal of this report is to explore GLM with Negative Binomial for modelling claim count, we will carrying on refining this models. These plots will not be looked at again because plots from following models will exhibit very similar pattern.
+
+###Refining models with feature selection
+
+Unimportant variables with high coefficients for the models are length, height. fuel.type is also removed as it is a categorical feature that is important on all of its levels. *These result and the resulted model from stepAIC() can be found in Appendix 6.2.1*
+
+For categorical feature collapsing, I found that only the region variable have levels that can be combined. It is done as follow. *And please refer to Appendix 6.4.1 for the tables that were used for the analysis of levels that can be combined.* 
+
+```{r collapsing categorical, cache=T}
+region1<-ifelse(gen.data1$region%in%c(1,32),'group1',
+          ifelse(gen.data1$region %in% c(4,3),'group2',
+          ifelse(gen.data1$region %in% c(16,34,31),'group3',      
+          ifelse(gen.data1$region %in%  c(30,11),'group4', 
+          ifelse(gen.data1$region %in%  c(21,38,33), 'group5',
+          ifelse(gen.data1$region %in%  c(5,13),'group6',
+          ifelse(gen.data1$region %in%  c(14,12,23,37,19), 'group7',
+          ifelse(gen.data1$region %in%  c(36,6),'group8',gen.data1$region
+                       ))))))))
+region1<-as.factor(region1)
+
+gen.data11<-cbind(gen.data1[,-8],region1)
+gen.data31<-cbind(gen.data3[,-8],region1 )
+
+train.data11 <- gen.data11[index, ]
+test.data11 <- gen.data11[-index, ]
+train.data31 <- gen.data31[index, ]
+test.data31 <- gen.data31[-index, ]
+```
+
+**4 new models are considered at this point, they are done as follow:**
+```{r variables removed, cache=T}
+#model with unimportant variable with |coef|>1 removed (model 2)
+countmodel.nb.off2.1<-glm.nb(claim.count~.+offset(log(exposure))
+                             -exposure-freq-sev-
+                               tot.loss-claim.incurred-length-
+                               height-fuel.type,data=train.data)
+
+#model with stepAIC variable (model 3)
+countmodel.nb.off2.2<-glm.nb(claim.count ~ business.type + driver.age + driver.gender + 
+  marital.status + yrs.licensed + ncd.level + region + body.code + 
+  vehicle.age + vehicle.value + no.seats + horse.power + weight + 
+  width + prior.claims + offset(log(exposure)),data=train.data)
+
+#model with unimportant variable with |coef|>1 removed (model 4)
+#   and collapsed categorical variable
+countmodel.nb.off2.3<-glm.nb(claim.count~.+offset(log(exposure))-exposure-
+                               freq-sev-tot.loss-claim.incurred-length-height-
+                           fuel.type,data=train.data11)
+
+#model with stepAIC variable and collapsed categorical variable 
+#(model 5)
+countmodel.nb.off2.4<-glm.nb(claim.count~business.type+driver.age+
+                               driver.gender+yrs.licensed+ncd.level+
+                               region1+vehicle.age+vehicle.value 
+                               +no.seats+horse.power+weight+width+prior.claims 
+                             + offset(log(exposure)),data=train.data11)
+
+
+
+
+pred.nb.off2.1<-predict(countmodel.nb.off2.1,test.data,type='response')
+pred.nb.off2.2<-predict(countmodel.nb.off2.2,test.data,type='response')
+pred.nb.off2.3<-predict(countmodel.nb.off2.3,test.data11,type='response')
+pred.nb.off2.4<-predict(countmodel.nb.off2.4,test.data11,type='response')
+test.MSE1<-c(RMSE(test.data1$claim.count,pred.nb.off2.1),
+             RMSE(test.data1$claim.count,pred.nb.off2.2),
+             RMSE(test.data11$claim.count,pred.nb.off2.3),
+             RMSE(test.data11$claim.count,pred.nb.off2.4))
+k=5
+set.seed(1)
+P5<-cv.glm(train.data,countmodel.nb.off2.1,K=k)
+P6<-cv.glm(train.data,countmodel.nb.off2.2,K=k)
+P7<-cv.glm(train.data11,countmodel.nb.off2.3,K=k)
+P8<-cv.glm(train.data11,countmodel.nb.off2.4,K=k)
+cv.error2<-c(P5$delta[2],P6$delta[2],P7$delta[2],P8$delta[2])
+
+
+tab2<-cbind(c(AIC(countmodel.nb.off),
+      AIC(countmodel.nb.off2.1),
+      AIC(countmodel.nb.off2.2),
+      AIC(countmodel.nb.off2.3),
+      AIC(countmodel.nb.off2.4)),
+      c(BIC(countmodel.nb.off),
+      BIC(countmodel.nb.off2.1),
+      BIC(countmodel.nb.off2.2),
+      BIC(countmodel.nb.off2.3),
+      BIC(countmodel.nb.off2.4)))
+colnames(tab2)<-c('AIC','BIC')
+rownames(tab2)<-c('original model (1)',
+                  'unimportant variables with |coef|>0.1 removed (2)',
+                  'variables chosen via stepAIC (3)',
+                  'model (2) with collapsed categorical variables (4)',
+                  'model (3) with collapsed categorical variable (5)')
+tab2<-cbind(tab2,cv.error=c(cv.error1[3],cv.error2),
+            test.RMSE=c(test.MSE[3],test.MSE1) )
+```
+
+
+```{r freqres2,echo=F}
+knitr::kable(tab2, caption='performance of initial claim count models')%>%
+  kable_styling(latex_options = "HOLD_position" )
+```
+
+From table \@ref(tab:freqres2) the new models outperform the original one in most criteria.  AIC and BIC heavily favour the models with collapsed categorical variables as they have much less categorical levels. And cross validation and MSE show they perform as good as or even slightly better, indicating that combining levels may actually work. But I will continue using all 4 since as I could not come to any conclusion at this stage.
+
+###Modelling claim count with interaction
+
+I look for interaction terms using the follow procedure. Important interacting variables from these two will be added to my model.
+
+```{r interaction1, cache=T, results=F}
+count.personal<-glm.nb(claim.count~(marital.status+driver.gender+driver.age)^2,
+                      data=train.data1)
+count.vehicle<-glm.nb(claim.count~(vehicle.age+vehicle.value+no.seats+cubic.cent
+                                      +horse.power+weight+fuel.type
+                                    +length+width+height)^2,
+                       data=train.data)
+
+```
+For policyholders personal information, there's no noticeable interaction. But for vehicle information there are interaction between *width and height* of the vehicle and between *cubic.cent and weight* (*Please refer to Appendix 6.3.1 for the result*) These two interaction will be added to the 4 models above resulting in 8 models to consider
+
+```{r interaction.freq, cache=T}
+# model 2 with interaction (model 6)
+countmodel.nb.off3.1<-glm.nb(claim.count~.+offset(log(exposure))-
+      exposure-freq-sev-tot.loss-claim.incurred-length-height-
+      fuel.type+weight:height+cubic.cent:weight,
+                         data=train.data )
+# model 3 with interaction (model 7)
+countmodel.nb.off3.2<-glm.nb(claim.count~business.type + driver.age + 
+      driver.gender + marital.status +yrs.licensed + ncd.level+region +
+      body.code + vehicle.age + vehicle.value + no.seats +    
+      horse.power+weight + width +prior.claims + offset(log(exposure))+
+      weight:height+cubic.cent:weight,
+      data=train.data)
+# model 4 with interaction (model 8)
+countmodel.nb.off3.3<-glm.nb(claim.count~.+offset(log(exposure))-
+      exposure-freq-sev-tot.loss-claim.incurred-length-height-
+      fuel.type+height:width+cubic.cent:weight,
+                             data=train.data11)
+# model 5 with interaction (model 9)
+countmodel.nb.off3.4<-glm.nb(claim.count~business.type + driver.age + driver.gender +
+                               yrs.licensed + ncd.level + region1+ vehicle.age + 
+                               vehicle.value + no.seats + horse.power + weight + width + 
+                               prior.claims + offset(log(exposure))+
+                               +height:width+cubic.cent:weight,
+                         data=train.data11)
+
+pred.nb.off3.1<-predict(countmodel.nb.off3.1,test.data,type='response')
+pred.nb.off3.2<-predict(countmodel.nb.off3.2,test.data,type='response')
+pred.nb.off3.3<-predict(countmodel.nb.off3.3,test.data11,type='response')
+pred.nb.off3.4<-predict(countmodel.nb.off3.4,test.data11,type='response')
+test.MSE2<-c(RMSE(test.data$claim.count,pred.nb.off3.1),
+             RMSE(test.data$claim.count,pred.nb.off3.2),
+             RMSE(test.data11$claim.count,pred.nb.off3.3),
+             RMSE(test.data11$claim.count,pred.nb.off3.4))
+
+k=5
+set.seed(1)
+P9<-cv.glm(train.data,countmodel.nb.off3.1,K=k)
+P10<-cv.glm(train.data,countmodel.nb.off3.2,K=k)
+P11<-cv.glm(train.data11,countmodel.nb.off3.3,K=k)
+P12<-cv.glm(train.data11,countmodel.nb.off3.4,K=k)
+cv.error3<-c(P9$delta[2],P10$delta[2],P11$delta[2],P12$delta[2])
+
+tab3<-cbind(c(AIC(countmodel.nb.off3.1),
+              AIC(countmodel.nb.off3.2),
+              AIC(countmodel.nb.off3.3),
+              AIC(countmodel.nb.off3.4)),
+            c(BIC(countmodel.nb.off3.1),
+              BIC(countmodel.nb.off3.2),
+              BIC(countmodel.nb.off3.3),
+              BIC(countmodel.nb.off3.4)))
+colnames(tab3)<-c('AIC','BIC')
+rownames(tab3)<-c('model (2) with interaction',
+                  'model (3) with interaction',
+                  'model (4) with interaction',
+                  'model (5) with interaction')
+tab3<-cbind(tab3,cv.error=cv.error3, test.RMSE=test.MSE2)
+tab4<-rbind(tab2,tab3)
+```
+
+
+```{r freqres3,echo=F}
+knitr::kable(tab4, caption='performance of chosen variables claim count models')%>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+
+Looking at the table, it can be seen that the added interaction term do not improve the models, as they generally have higher AIC, BIC and lower cv errors. Although the for test error, we got mixed results when interaction terms are added, but this can also be caused by sampling errors. Consequently, the identified interaction may not be useful.
+
+###Chosen model
+
+For modelling claim count and consequently the frequency of claim, I will choose the model with no PC, with unimportant variable with high coefficient removed, collapsed categorical variable and no interaction. This is because it performs the best in AIC and cross validation error, third best for BIC while its test error is not too high comparing to others model.
+
+##Severity
+
+For severity, it is important to first extract from the train and test data the observation that did have a claim. The data for modelling is prepared as follow:
+
+```{r creating train and test data for severity, cache=T}
+train.sev<-train.data%>%
+  filter(sev>0 )
+
+test.sev<-test.data%>%
+  filter(sev>0)
+train.sev1<-train.data1%>%
+  filter(sev>0)
+
+test.sev1<-test.data1%>%
+  filter(sev>0)
+```
+
+###Initial models
+Since no offset in this model was identified, there are only 2 initial models. 
+
+
+```{r sev.raw, cache=T}
+#Model with no PC
+sev.modelgam<-glm(sev~.-claim.incurred-freq-claim.count-tot.loss,
+                  data=train.sev,
+               family=Gamma(link='log') )
+#Model with PC
+sev.modelgam1<-glm(sev~.-claim.incurred-freq-claim.count-tot.loss,
+                   data=train.sev1,
+               family=Gamma(link='log'))
+
+set.seed(1)
+P13<-cv.glm(train.sev,sev.modelgam,K=k)
+P14<-cv.glm(train.sev1,sev.modelgam1,K=k)
+cv.err.sev<-c(P13$delta[2],P14$delta[2])
+pred.sevgam<-predict(sev.modelgam,test.sev,type='response')
+pred.sevgam1<-predict(sev.modelgam1,test.sev1,type='response')
+test.sev.MSE<-c(RMSE(test.sev$sev,pred.sevgam),
+                RMSE(test.sev$sev,pred.sevgam1))
+tab5<-cbind(c(AIC(sev.modelgam),
+              AIC(sev.modelgam1)),
+            c(BIC(sev.modelgam),
+              BIC(sev.modelgam1)))
+colnames(tab5)<-c('AIC','BIC')
+rownames(tab5)<-c('model with no PC','model with PC')
+tab5<-cbind(tab5,cv.error=cv.err.sev,test.RMSE=test.sev.MSE)
+```
+
+```{r sevres1,echo=F}
+knitr::kable(tab5, caption='performance initial severity models')%>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+Table \@ref(tab:sevres1) shows that, unlike with claim count, this time model with PC outperform the one with no PC in all criteria. Hence the second one will continue to be used for refining
+
+But before moving on, it is worth checking the residuals plot resulted from these models.
+```{r FV-SDR2,echo=F, cache=T,fig.width=7, fig.height=3, fig.align =  'center',fig.pos = 'H',fig.cap="\\label{FV-SDR2} Fitted value vs Standardized deviance residuals"}
+par(mfrow=c(1,2))
+plot(sev.modelgam$fitted.values,rstandard(sev.modelgam),
+     xlab="Fitted values",ylab="Standardized deviance residuals",
+     main='Model with no PC',
+     xlim = c(0,max(sev.modelgam$fitted.values)+500),ylim=c(-3,3))
+abline(h=0,col="red",lty=2)
+
+
+plot(sev.modelgam1$fitted.values,rstandard(sev.modelgam1),
+     xlab="Fitted values",ylab="Standardized deviance residuals",
+     main='Model with PC',
+     xlim = c(0,max(sev.modelgam$fitted.values)+500),ylim=c(-3,3))
+abline(h=0,col="red",lty=2)
+```
+
+
+```{r qq2,echo=F,  cache=T, fig.width=7, fig.height=3, fig.align =  'center',fig.pos = 'H',fig.cap="\\label{fig:qq2} QQ plots" }
+par(mfrow=c(1,2))
+qqnorm(rstandard(sev.modelgam)) 
+qqline(rstandard(sev.modelgam),col="red")
+qqnorm(rstandard(sev.modelgam1)) 
+qqline(rstandard(sev.modelgam1),col="red")
+```
+
+The random residuals pattern appear around the red line in figure \@ref(fig:FV-SDR2) indicates that the underlying distribution, Gamma, is indeed a good one to be used. However, this distribution still has some flaw as shown in \@ref(fig:qq2) where there is some deviation around the red lines at the left tails. This indicate that the distribution does not fit the data well at smaller claim amount.
+
+###Refining models with Feature selection
+
+Unimportant variables with high coefficients and categorical features that are important on all of its levels for the severity model are body.code, exposure, marital.status, driver.gender, fuel.type. *These result and the resulted model from stepAIC() can be found in Appendix 6.2.2*
+
+For combining levels, this time aside from region I also found that body.code and ncd.level also have levels that can be combined. (*Please refer to Appendix 6.4.2 for the tables that were used for this.*) They are combined as follow:
+
+```{r cat.combine2, cache=T}
+region2<-ifelse(gen.data1$region %in% c(30,21,34,12),'group1',
+                ifelse(gen.data1$region %in% c(20,38,27,16,37),'group2',
+                ifelse(gen.data1$region %in% c(5,19),'group3',
+                ifelse(gen.data1$region %in% c(28,22),'group4',
+                ifelse(gen.data1$region %in% c(1,25),'group5',
+                ifelse(gen.data1$region %in% c(32,15,18), 'group6',gen.data1$region
+                                               ))))))
+
+body.code2<-ifelse(gen.data1$body.code %in% c('C','G'),'group1',
+                   gen.data1$body.code)
+ncd.level2<-ifelse(gen.data1$ncd.level %in% c(4,6),'group1',
+                   gen.data1$body.code)
+region2<-as.factor(region2)
+body.code2<-as.factor(body.code2)
+ncd.level2<-as.factor(ncd.level2)
+gen.data12<-cbind(gen.data1[,-c(7,8,9)],region2,body.code2,ncd.level2)
+gen.data32<-cbind(gen.data3[,-c(7,8,9)],region2,body.code2,ncd.level2)
+
+train.sev2<-gen.data32[index,]%>%
+  filter(sev>0 )
+test.sev2<-gen.data32[-index,]%>%
+  filter(sev>0 )
+```
+
+**Then the four models are built as follow**
+
+```{r variables removed2, cache=T}
+#model with unimportant variables with high coefficient removed (model 2)
+sev.modelgam1.1<-glm(sev~.-claim.incurred-freq-claim.count-tot.loss-body.code
+                     -exposure-marital.status-driver.gender-fuel.type,
+                 data=train.sev1,
+                 family=Gamma(link='log') )
+#model with stepAIC variables (model 3)
+sev.modelgam1.2<-glm(sev ~ exposure + ncd.level + PCage1,family=Gamma(link='log'),
+                     data=train.sev1)
+#model 2 with collapsed categorical variables
+sev.modelgam1.3<-glm(sev~.-claim.incurred-freq-claim.count-tot.loss
+                     -exposure-marital.status-driver.gender-fuel.type,
+                     data=train.sev2,
+                     family=Gamma(link='log'))
+#model 3 with collapsed categorical variables
+sev.modelgam1.4<-glm(sev ~ exposure + ncd.level2+ body.code2 
+                     +region2+ PCage1,family=Gamma(link='log'),
+                     data=train.sev2)
+
+k=5
+set.seed(1)
+P15<-cv.glm(train.sev1,sev.modelgam1.1,K=k)
+P16<-cv.glm(train.sev1,sev.modelgam1.2,K=k)
+P17<-cv.glm(train.sev2,sev.modelgam1.3,K=k)
+P18<-cv.glm(train.sev2,sev.modelgam1.4,K=k)
+cv.err.sev1<-c(P15$delta[2],P16$delta[2],P17$delta[2],P18$delta[2])
+
+
+pred.sevgam1.1<-predict(sev.modelgam1.1,test.sev1,type='response')
+pred.sevgam1.2<-predict(sev.modelgam1.2,test.sev1,type='response')
+pred.sevgam1.3<-predict(sev.modelgam1.3,test.sev2,type='response')
+pred.sevgam1.4<-predict(sev.modelgam1.4,test.sev2,type='response')
+test.sev.MSE1<-c(RMSE(test.sev1$sev,pred.sevgam1.1),
+                RMSE(test.sev1$sev,pred.sevgam1.2),
+                RMSE(test.sev2$sev,pred.sevgam1.3),
+                RMSE(test.sev2$sev,pred.sevgam1.4))
+
+tab6<-cbind(c(AIC(sev.modelgam1),
+              AIC(sev.modelgam1.1),
+              AIC(sev.modelgam1.2),
+              AIC(sev.modelgam1.3),
+              AIC(sev.modelgam1.4)),
+            c(BIC(sev.modelgam1),
+              BIC(sev.modelgam1.1),
+              BIC(sev.modelgam1.2),
+              BIC(sev.modelgam1.3),
+              BIC(sev.modelgam1.4))
+            )
+colnames(tab6)<-c('AIC','BIC' )
+rownames(tab6)<-c('original model (1)',
+                  'unimportant variable with |coef|>0.1 removed (2)',
+                  'variables chosen using stepAIC (3)',
+                  'model 2 with collapsed categorical variables (4)',
+                  'model 3 with collapsed categorical variables (5)')
+tab6<-cbind(tab6,cv.error=c(P14$delta[2],cv.err.sev1),
+            test.RMSE=c(test.sev.MSE[2],test.sev.MSE1 ))
+```
+
+```{r sevres2,echo=F }
+knitr::kable(tab6, caption='performance severity models with feature selection')%>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+Based on the result in table \@ref(tab:sevres2) there are strong indication that collapsing category levels may make models with stepAIC perform worse as the cross validation, AIC and BIC increased when categorical features are collapsed. On the other hand it seems to improve the model with only high coefficient, unimportant variables removed. Yet all 4 will still be considered
+
+
+### With interaction
+Finding interaction term will be carried out similarly to the previous model. *And the result can be found in Appendix 6.3.2 *
+
+```{r interaction 2, cache=T}
+sev.personal<-glm(sev~(marital.status+driver.gender+driver.age)^2,
+                  data=train.sev1,
+                  family=Gamma(link='log') )
+sev.vehicle<-glm(sev~(PCage1+ PCsize1+PCsize2+PCsize3+fuel.type)^2,
+                       data=train.sev1,
+                  family=Gamma(link='log') )
+
+```
+
+For severity, there are no noticeable interaction from these two models. As the interaction between  `PCage1` and cars run on gasoline are close to be important, the interaction between `PCage1` and `fuel.type` will be added for testing (I tested more term than supposed to as I suspect they will all be insignificant)
+
+```{r interaction.sev, cache=T}
+#model 2 with interaction
+sev.modelgam2.1<-glm(sev~.-claim.incurred-freq-claim.count-tot.loss-body.code
+                     -exposure-marital.status-driver.gender-fuel.type
+                     +PCage1:fuel.type,data=train.sev1,family=Gamma(link='log') )
+
+#model 3 with interaction
+sev.modelgam2.2<-glm(sev~exposure + ncd.level + PCage1+PCage1:fuel.type,
+                     data=train.sev1,family=Gamma(link='log') )
+
+#model 4 with interaction
+sev.modelgam2.3<-glm(sev~.-claim.incurred-freq-claim.count-tot.loss
+                     -exposure-marital.status-driver.gender-fuel.type
+ +PCage1:fuel.type,data=train.sev2,family=Gamma(link='log'))
+
+#model 5 with interaction
+sev.modelgam2.4<-glm(sev ~ exposure + ncd.level2+ body.code2 
+                     +region2+ PCage1+PCage1:fuel.type,
+                     family=Gamma(link='log'),data=train.sev2)
+
+tab7<-cbind(c(AIC(sev.modelgam2.1),
+              AIC(sev.modelgam2.2),
+              AIC(sev.modelgam2.3),
+              AIC(sev.modelgam2.4)),
+              c(BIC(sev.modelgam2.1),
+              BIC(sev.modelgam2.2),
+              BIC(sev.modelgam2.3),
+              BIC(sev.modelgam2.4)
+           )
+)
+colnames(tab7)<-c('AIC','BIC')
+rownames(tab7)<-c('(2) with interaction effect (6)',
+                  '(3) with interaction effect (7)',
+                  '(4) with interaction effect (8)',
+                  '(5) with interaction effect (9)')
+set.seed(1)
+P19<-cv.glm(train.sev1,sev.modelgam2.1,K=k)
+P20<-cv.glm(train.sev1,sev.modelgam2.2,K=k)
+P21<-cv.glm(train.sev2,sev.modelgam2.3,K=k)
+P22<-cv.glm(train.sev2,sev.modelgam2.4,K=k)
+
+
+cv.err.sev2<-c(P19$delta[2],P20$delta[2],P21$delta[2],P22$delta[2])
+
+pred.sevgam2.1<-predict(sev.modelgam2.1,test.sev1,type='response')
+pred.sevgam2.2<-predict(sev.modelgam2.2,test.sev1,type='response')
+pred.sevgam2.3<-predict(sev.modelgam2.3,test.sev2,type='response')
+pred.sevgam2.4<-predict(sev.modelgam2.4,test.sev2,type='response')
+
+
+test.sev.MSE2<-c(RMSE(test.sev1$sev,pred.sevgam2.1),
+                 RMSE(test.sev1$sev,pred.sevgam2.2),
+                 RMSE(test.sev2$sev,pred.sevgam2.3),
+                 RMSE(test.sev2$sev,pred.sevgam2.4))
+tab7<-cbind(tab7,cv.error=cv.err.sev2,test.RMSE=test.sev.MSE2)
+tab8<-rbind(tab6[,],tab7 )
+```
+
+```{r sevres3,echo=F}
+knitr::kable(tab8, caption='performance finals candidate severity models')%>%
+  kable_styling(latex_options = "HOLD_position")
+```
+Looking at table \@ref(tab:sevres3), we can see that the interaction term have no noticeable impact on the model 2, but it does improve model 3 slightly in cross validation error and test error.
+
+###Chosen model
+For severity, based on the result, I will choose the model that use PC variables,  and stepAIC for variable selection. This is because the model perform the best cross validation error, AIC and BIC. However, the fact that stepAIC removes most variable indicate that very few features have good predictive variable for severity. Hence, despite having adequate underlying distribution, this models may still perform poorly.
+
+#Final result
+```{r finalres, cache=T}
+final.pred.freq<-predict(countmodel.nb.off2.3,test.data11,
+                         type='response') / test.data11$exposure
+final.pred.sev<-predict(sev.modelgam1.2,test.data1,type='response')
+
+final.pred.prem<-final.pred.freq*final.pred.sev
+
+testMSE.prem<-sqrt(mean((final.pred.prem-test.data1$tot.loss)^2))
+postResample(pred=final.pred.prem,obs=test.data$tot.loss )
+```
+
+
+The final result indicate that using GLM with negative binomial distribution to model freqency and using GLM with gamma distribution to model severity may not be the best option to predict the pure premium for its high error and close to 0 R squared. However, this is probably due to negative binomial may not be a good assumption of claim count distribution, and for severity, input may not have predictive power to predict this response. However, looking from another perspective, the total claim incurred on the test data set is `r {sum(test.data$claim.incurred)}`, while the predicted sum is `r {sum(final.pred.sev*predict(countmodel.nb.off2.3,test.data11,type='response'))}`. And from this perspective, the model seem to perform relatively well.
+
+##Limitation
+Negative binomials does not seem to be an appropriate distribution for claim count. Furthermore, another problem is that the dataset does not seem to contain many individual variables with strong predictive powers for both frequency and severity. Furthermore, predictors that are likely to have interaction effect was not identified in my models. This is because limited pairwise interaction can be tested (because of the lack of computational power and numerous variables at hand).
+
+Hence other to improve this GLM I recommend using another underlying distribution for claim count, which is worked on by my teammate. And more interaction effect should be tested.
+
+\newpage
+
+#Appendix
+##Exploration
+```{r gg.sev and gg.freq,cache=T, echo=F}
+gg.sev<-ggplot(test.sev, 
+               aes(y=log(sev)))+
+  ylab('log of severity')
+gg.freq<-ggplot(train.data, 
+                aes(y=as.factor(claim.count)))
+```
+
+###Frequency
+```{r claimcount-vs-numerical,echo=F,cache=T,fig.cap="\\label{fig:claimcount-vs-numerical}  claim count against some numerical feature"}
+plot1<-gg.freq+
+  geom_boxplot(aes(x=cubic.cent))+
+  ylab('claim count')
+plot2<-gg.freq+
+  geom_boxplot(aes(x=weight))+
+  ylab('claim count')
+plot3<-gg.freq+
+  geom_boxplot(aes(x=vehicle.value))+
+  ylab('claim count')
+plot4<-gg.freq+
+  geom_boxplot(aes(x=yrs.licensed))+
+  ylab('claim count')
+grid.arrange(plot1,plot2,plot3,plot4, nrow=2)
+```
+
+```{r claimcount-vs-categorical,echo=F,cache=T,fig.cap="\\label{fig:claimcount-vs-categorical}  claim count against some categorical feature"}
+plot5<-gg.freq+
+  geom_count(aes(x=business.type))+
+  ylab('claim count')
+plot6<-gg.freq+
+  geom_count(aes(x=marital.status))+
+  ylab('claim count')
+plot7<-gg.freq+
+  geom_count(aes(x=fuel.type))+
+  ylab('claim count')
+plot8<-gg.freq+
+  geom_count(aes(x=ncd.level))+
+  ylab('claim count')
+grid.arrange(plot5,plot6,plot7,plot8, nrow=2)
+```
+
+
+###Severity
+```{r severity-vs-categorical,echo=F,cache=T,fig.cap="\\label{fig:severity-vs-categorical}  severity against some categorical feature"}
+plot9<-gg.sev+
+  geom_boxplot(aes(ncd.level))
+plot10<-gg.sev+
+  geom_boxplot(aes(x=body.code))
+plot11<-gg.sev+
+  geom_boxplot(aes(x=fuel.type))
+plot12<-gg.sev+
+  geom_boxplot(aes(x=marital.status))
+
+grid.arrange(plot9,plot10,plot11,plot12, nrow=2)
+```
+
+```{r severity-vs-numerical,echo=F,cache=T,fig.cap="\\label{fig:severity-vs-numerical}  severity against some numerical features"}
+plot13<-gg.sev+
+  geom_point(aes(exposure))
+plot14<-gg.sev+
+  geom_point(aes(driver.age))
+plot15<-gg.sev+
+  geom_point(aes(yrs.licensed))
+plot16<-gg.sev+
+  geom_point(aes(vehicle.age))
+
+grid.arrange(plot13,plot14,plot15,plot16, nrow=2)
+```
+##Feature selection
+###For frequency
+```{r feature selection, cache=T}
+#Looking for unimportant variables with high coefficient
+summary(countmodel.nb.off)
+
+#Feature selection with stepAIC
+countmodel.none<-glm.nb(claim.count~1,data=train.data)
+step.choose<-stepAIC(countmodel.nb.off,
+                     direction = "backward",
+                     k = 2,
+                     scope = list(upper = countmodel.nb.off, lower = countmodel.none)
+)
+
+```
+
+###For severity
+
+```{r feature for sev, cache=T}
+#Feature selection with stepAIC
+sev.model.none<-glm(sev~1,
+                    data=train.sev1,
+                    family=Gamma(link='log'))
+step.choose1<-stepAIC(sev.modelgam1,
+                     direction = "backward",
+                     k = 2,
+                     scope = list(upper = sev.modelgam1, 
+                                  lower = sev.model.none)
+)
+```
+
+
+```{r finding high coef2, cache=T}
+#Looking for unimportant variables with high coefficient
+summary(sev.modelgam1 )
+```
+##Interaction identification 
+
+###For claim count
+```{r interact.res1, echo=T}
+summary(count.personal)
+summary(count.vehicle)
+```
+
+
+###For severity
+```{r interact.res2, echo=T}
+summary(sev.personal)
+summary(sev.vehicle )
+```
+
+
+##collapsing categorical data
+### For Frequency
+**Grouped region for frequency**
+```{r, cache=T}
+region.analysis<-train.data1%>%
+       group_by(region)%>%
+       summarize(mean.freq=mean(claim.count),
+                  sd.freq=sd(claim.count),
+                 count=n())
+```
+
+```{r, echo=F}
+kable(list(group1=region.analysis%>% filter(region %in%c(1,32)),
+           group2=region.analysis%>% filter(region %in%c(4,3)),
+           group3=region.analysis%>% filter(region %in%c(16,34,31)),
+           group4=region.analysis%>% filter(region %in%c(11,30)),
+           group5=region.analysis%>% filter(region %in%c(21,38,33)),
+           group6=region.analysis%>% filter(region %in%c(5,13)),
+           group7=region.analysis%>% filter(region %in%c(14,12,23,37,19)),
+           group8=region.analysis%>% filter(region %in%c(6,36))),
+      align='l',caption = "grouped region for frequecy")%>%
+  kable_styling(font_size = 10,bootstrap_options ="condensed", 
+                full_width = F,latex_options = "HOLD_position")
+
+```
+
+**Analyzing body codes**
+```{r}
+bodycode.analysis<-train.data1%>%
+  group_by(body.code)%>%
+  summarize(mean.freq=mean(claim.count),
+            sd.freq=sd(claim.count),
+            count=n())
+```
+
+```{r, cache=T,echo=F }
+knitr::kable(bodycode.analysis, caption='analyzing grouping for Body code')%>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+
+**Marital status**
+```{r}
+marital.analysis<-train.data1%>%
+  group_by(marital.status)%>%
+  summarize(mean.freq=mean(claim.count),
+            sd.freq=sd(claim.count),
+            count=n())
+```
+
+```{r, cache=T,echo=F }
+knitr::kable(marital.analysis, caption='analyzing grouping for Marital status')%>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+
+**ncd levels**
+```{r}
+ncd.analysis<-train.data1%>%
+  group_by(ncd.level)%>%
+  summarize(mean.freq=mean(claim.count),
+            sd.freq=sd(claim.count),
+            count=n())
+```
+
+```{r, cache=T ,echo=F}
+knitr::kable(ncd.analysis, caption='analyzing grouping for ncd level')%>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+###For severity
+**Grouped region for severity**
+```{r}
+region.analysis<-train.data1%>%
+       group_by(region)%>%
+       summarize(mean.freq=mean(claim.count),
+                 count=n())
+```
+
+```{r, echo=F}
+kable(list(group1=region.analysis%>% filter(region %in%c(30,21,34,12)),
+           group2=region.analysis%>% filter(region %in%c(20,38,27,16,37)),
+           group3=region.analysis%>% filter(region %in%c(5,19)),
+           group4=region.analysis%>% filter(region %in%c(28,22)),
+           group5=region.analysis%>% filter(region %in%c(1,25)),
+           group6=region.analysis%>% filter(region %in%c(32,15,18))),
+      align='l',caption = "grouped region for severity")%>%
+  kable_styling(font_size = 10,bootstrap_options ="condensed", 
+                full_width = F,latex_options = "HOLD_position")
+
+```
+
+```{r}
+ncd.analysis.sev<-train.data1%>%
+  filter(sev>0)%>%
+  group_by(ncd.level)%>%
+  summarize(mean.sev=mean(sev),
+            median.sev=median(sev),
+            count=n())
+```
+```{r, cache=T, echo=F }
+knitr::kable(ncd.analysis.sev%>%filter(ncd.level %in%c(4,6)), caption='grouped ncd levels')%>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+
+```{r}
+bodycode.analysis.sev<-train.data1%>%
+  filter(sev>0)%>%
+  group_by(body.code)%>%
+  summarize(mean.sev=mean(sev),
+            median.sev=median(sev),
+            count=n())
+```
+```{r, cache=T, echo=F }
+knitr::kable(bodycode.analysis.sev%>%filter(body.code %in%c('G','C')), caption='grouped body code levels')%>%
+  kable_styling(latex_options = "HOLD_position")
+```
+
+```{r}
+marital.analysis.sev<-train.data1%>%
+  filter(sev>0)%>%
+  group_by(marital.status)%>%
+  summarize(mean.sev=mean(sev),
+            median.sev=median(sev),
+            count=n())
+```
+```{r, cache=T, echo=F }
+knitr::kable(marital.analysis.sev, caption='analysiing grouping for marital levels')%>% kable_styling(latex_options = "HOLD_position")
+```
